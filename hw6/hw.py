@@ -228,13 +228,14 @@ def experiment():
             labels   = [v['label'] for (k, v) in bow.items()]
             features = [v['bag']   for (k, v) in bow.items()]
 
-            green('Train...')
+            
             pb  = svm_problem(labels, features)
             for c in range(-2, 9):
               green('log10(C) = %i' % c)
               blue('%s' % ((count * 100) / 704))
               count += 1
               param = svm_parameter('-t 0 -c %s -v 5 -q' % pow(10, - c))
+              green('Train...')
               acc = svm_train(pb, param)
               results.write('%s, %s, %s\n' % (', '.join(map(str, list(params))), c, acc))
   results.close()
