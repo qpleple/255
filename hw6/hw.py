@@ -7,6 +7,8 @@ import re
 from copy import deepcopy
 from termcolor import cprint , colored
 from stemming.porter2 import stem
+from math import log, fabs, pow
+from svmutil import *
 
 # -----------------------------------------------------------------------------
 # Utils
@@ -68,8 +70,8 @@ def readCorpus():
 #   ...
 # }
 
-def computeBow(corpus, vocab):
-  lookupvocab = dict([(w, i) for (i, w) in enumerate(vocab)])
+def computeBow(corpus, vocab, lookupvocab):
+  
 
   stats = {}
   bow   = {}
@@ -96,59 +98,16 @@ def computeBow(corpus, vocab):
   for w in stats:
     stats[w]['fn'] = 1000 - stats[w]['tp']
     stats[w]['tn'] = 1000 - stats[w]['fp']
-    for k in stats[w]:
-      if k != 'idx':
-        stats[w][k] = max(0.5, float(stats[w][k]))
+    
   
   return stats, bow
-  
-def testBow(vocab, stats, bow):
-  for filename in bow:
-    # Set of words from the file
-    label = bow[filename]['label']
-    if label:
-      directory = 'data/review_polarity/pos/'
-    else:
-      directory = 'data/review_polarity/neg/'
-    with open(directory + filename) as f:
-      words = set(f.read().split())
-    # Set of words from the bow
-    wordsbow = set([vocab[i] for i in bow[filename]['bag']])
-    if wordsbow != words:
-      red('error for ' + filename)
-      yellow('Set of words from the file')
-      print(words)
-      yellow('Set of words from the bow')
-      print(wordsbow)
-      return
-  green('passed')
-  
 
-def storeBow():
-  yellow('reading')
-  corpus = readCorpus()
-  yellow('computing')
-  vocab, stats, bow = computeBow(corpus)
-  yellow('testing')
-  testBow(vocab, stats, bow)
-  yellow('storing')  
-  store(vocab, 'vocab')
-  store(stats, 'stats')
-  store(bow, 'bow')
 
 # vocab, stats, bow = (load('vocab'), load('stats'), load('bow'))
 
 # -----------------------------------------------------------------------------
 # Preprocessing
 # -----------------------------------------------------------------------------
-
-# def storeAllCorpus():
-#   yellow('reading')
-#   rawCorpus = readCorpus()
-#   yellow('building')
-#   corpuses = buildAllCorpuses(rawCorpus)
-#   yellow('storing')
-#   store(corpuses, 'corpuses')
 
 def storeVocab():
   yellow('loading')
@@ -194,11 +153,13 @@ def storePunctuation(corpus):
   punctuation = set([w for w in allWords if len(w) == 1 and r.match(w)])
   store(punctuation, 'punctuation')
 
-def buildAllCorpuses():
+def experiment():
+  results = open('results.csv', 'w')
   options = {}
   yellow('loading')
   green('vocab')
   vocab        = load('vocab')
+  lookupvocab = dict([(w, i) for (i, w) in enumerate(vocab)])
   green('corpus')
   corpusRaw    = load('corpus')
   green('corpus stemmed')
@@ -208,21 +169,24 @@ def buildAllCorpuses():
   green('corpus punctuation')
   punctuation  = load('punctuation')
 
+  count = 1
+
   for doStemming in [True, False]:
-    #for featureTransformation in ['none', 'indic', 'logplusone', 'logodds']:
+    for featureTransformation in ['none', 'indic', 'logplusone', 'logodds']:
       for excludeUnitWords in [True, False]:
         for excludeStopWords in [True, False]:
           for excludePunctuation in [True, False]:
             yellow({
+              'featureTransformation': featureTransformation,
               'doStemming': doStemming,
               'excludeStopWords': excludeStopWords,
               'excludePunctuation': excludePunctuation,
               'excludeUnitWords': excludeUnitWords,
             })
+            params  = (featureTransformation, doStemming, excludeStopWords, excludePunctuation, excludeUnitWords)
+            bowName = "bow.feat-%s.stem-%s.xSw-%s.xPun-%s.x1w-%s" % params
+            yellow(bowName)
 
-            #  "doStemming:%s, excludeStopWords:%s, excludePunctuation:%s"
-            #% (doStemming, excludeStopWords, excludePunctuation))
-            
             # Stemming
             green('copy')
             if doStemming:
@@ -244,34 +208,71 @@ def buildAllCorpuses():
 
             print " ".join(corpus['cv526_12083.txt']['words'])
 
-            stats, bow = computeBow(corpus, vocab)
-            print bow['cv526_12083.txt']
+            green('computing bow')
+            stats, bow = computeBow(corpus, vocab, lookupvocab)
+            if excludeUnitWords:
+              green('list unit words')
+              wordsToBeRemoved = set()
+              for (w, m) in stats.items():
+                if m['tp'] + m['fp'] == 1:
+                  wordsToBeRemoved.add(w)
+              green('removing those')
+              removeWordsFromCorpus(corpus, wordsToBeRemoved)
+              green('recomputing the')
+              stats, bow = computeBow(corpus, vocab, lookupvocab)
+
+            green('feature transformation: %s' % featureTransformation)
+            transformBow(featureTransformation, bow, stats, lookupvocab)
+
+            green('Libsvm format')
+            labels   = [v['label'] for (k, v) in bow.items()]
+            features = [v['bag']   for (k, v) in bow.items()]
+
+            green('Train...')
+            pb  = svm_problem(labels, features)
+            for c in range(-2, 9):
+              green('log10(C) = %i' % c)
+              blue('%s' % ((count * 100) / 704))
+              count += 1
+              param = svm_parameter('-t 0 -c %s -v 5 -q' % pow(10, - c))
+              acc = svm_train(pb, param)
+              results.write('%s, %s, %s\n' % (', '.join(map(str, list(params))), c, acc))
+  results.close()
 
 
-            
+def transformBow(featureTransformation, bow, stats, lookupvocab):
+  if featureTransformation == 'none':
+    return
 
-def buildDataSet(vocab, stats, bow, options):
-  wordsToRemove = set()
+  if featureTransformation == 'logodds':
+    weights = {}
+    for (w, m) in stats.items():
+      i = lookupvocab[w]
+      tp = max(0.5, float(m['tp']))
+      fp = max(0.5, float(m['fp']))
+      tn = max(0.5, float(m['tn']))
+      fn = max(0.5, float(m['fn']))
+      weights[i] = fabs(log(tp / fn) - log(fp / tn))
 
-  # --- Punctuation ---
-  if options['excludePunctuation']:
-    r = re.compile('[^0-9a-z]')
-    punctuation = set([x for x in vocab if len(x) == 1 and r.match(x)])
-    wordsToRemove.update(punctuation)
-  
-  # --- Stopwords ---
-  if options['excludeStopWords']:
-    wordsToRemove.update(load('stopwords'))
-    
-  if options['doStemming']:
-    for w in stats:
-      stemmed = stem(w)
-      if stemmed != w:
-        stats[w]['stemmed'] = stemmed
-      stats[stemmed]['tp'] += stats[w]['tp']
-      stats[stemmed]['fp'] += stats[w]['fp']
-      stats[stemmed]['fn'] = 1000 - stats[stemmed]['tp']
-      stats[stemmed]['tn'] = 1000 - stats[stemmed]['fp']
-    # for (filename, filedata) in bow.items():
-    #   for w in filedata['bag']
-      
+  for (filename, filedata) in bow.items():
+    for (i, count) in filedata['bag'].items():
+      if featureTransformation == 'indic':
+        filedata['bag'][i] = 1
+      elif featureTransformation == 'logplusone':
+        filedata['bag'][i] = log(1 + count)
+      elif featureTransformation == 'logodds':
+        filedata['bag'][i] = weights[i]
+
+
+# def dumpBowSvm(bow, name):
+#   with open('data/%s.svm', name) as f:
+#     for (filename, filedata) in bow.items():
+#       for (i, count) in filedata['bag'].items():
+
+def bla():
+  labels = [1,1]
+  features = [{1:1, 3:1}, {1:-1,3:-1}]
+  pb  = svm_problem(labels, features)
+  param = svm_parameter('-t 0 -c 4 -v 3 -q -b 1')
+  model = svm_train(pb, param)
+  print type(model)
